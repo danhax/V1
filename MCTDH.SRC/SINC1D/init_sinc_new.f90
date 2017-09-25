@@ -1,13 +1,15 @@
 
 #include "Definitions.INC"
 
+module jfunctmod
+contains
 
 function ffunct(xval)
   use myparams
   implicit none
   real*8, intent(in) :: xval
   DATATYPE :: ffunct, fac
-  real*8 :: fscaled, xx
+  real*8 :: xx
 
   fac=exp((0d0,1d0)*scalingtheta)*scalingstretch
 
@@ -34,7 +36,7 @@ function jfunct(xval)
   implicit none
   real*8, intent(in) :: xval
   DATATYPE :: jfunct, fac
-  real*8 :: jscaled, xx
+  real*8 :: xx
 
   fac=exp((0d0,1d0)*scalingtheta)*scalingstretch
 
@@ -61,7 +63,7 @@ function djfunct(xval)
   implicit none
   real*8, intent(in) :: xval
   DATATYPE :: djfunct, fac
-  real*8 :: djscaled, xx
+  real*8 :: xx
 
   fac=exp((0d0,1d0)*scalingtheta)*scalingstretch
 
@@ -88,7 +90,7 @@ function ddjfunct(xval)
   implicit none
   real*8, intent(in) :: xval
   DATATYPE :: ddjfunct, fac
-  real*8 :: ddjscaled, xx
+  real*8 :: xx
 
   fac=exp((0d0,1d0)*scalingtheta)*scalingstretch
 
@@ -160,6 +162,8 @@ function ddjscaled(xval)
   ddjscaled = 9d0/4d0*pi**2 * sin(pixval)**2 * cos(pixval)
 end function ddjscaled
 
+end module jfunctmod
+
 
 module ivopotmod
   implicit none
@@ -168,47 +172,27 @@ module ivopotmod
 end module ivopotmod
 
 
-subroutine ivo_project(inbigspf,outbigspf)
-  use myparams
-  use ivopotmod
-  implicit none
-  DATATYPE,intent(in) :: inbigspf(totpoints)
-  DATATYPE, intent(out) :: outbigspf(totpoints)
-  integer :: ii
-  outbigspf(:)=0d0
-  do ii=1,numocc
-     outbigspf(:)=outbigspf(:) + ivo_occupied(:,ii) * ivodot(ivo_occupied(:,ii),inbigspf(:),totpoints)
-  enddo
-
+module initspfsmod
 contains
-  function ivodot(inbra,inket,size)
-    use myparams
-    use mpisubmod    !! IN PARENT DIRECTORY
-    implicit none
-    integer,intent(in) :: size 
-    DATATYPE,intent(in) :: inbra(size),inket(size)
-    DATATYPE :: ivodot,csum
-    csum=DOT_PRODUCT(inbra,inket)
-    if (orbparflag) then
-       call mympireduceone(csum)
-    endif
-    ivodot=csum
-  end function ivodot
-
-end subroutine ivo_project
-
 
 subroutine init_spfs(inspfs,numloaded,numfrozen,frozenreduced)
   use myparams
   use pmpimod
   use pfileptrmod
   use ivopotmod
+  use tinvsubmod
+  use eigenmod      !! IN PARENT DIRECTORY
+  use lanblockmod   !! IN PARENT DIRECTORY
+  use utilmod !! IN PARENT DIRECTORY
   implicit none
   DATATYPE,intent(inout) :: inspfs(totpoints,numspf)
   integer, intent(in) :: numloaded,numfrozen
   DATATYPE,intent(in) :: frozenreduced(totpoints)
   DATATYPE,allocatable :: lanspfs(:,:),density(:)
   DATAECS,allocatable :: energies(:)
+  !$$
+  DATAECS,allocatable :: mybigspfham(:,:), bigvects(:,:), bigenergies(:)
+  !! AUTOMATIC ::  DATAECS :: mybigspfham(totpoints,totpoints), bigvects(totpoints,totpoints), bigenergies(totpoints)
   integer :: ibig,iorder,ispf,ppfac,ii,jj,kk,olist(numspf),flag
   integer :: null1,null2,null3,null4,null10(10),numcompute
 
@@ -296,16 +280,30 @@ subroutine init_spfs(inspfs,numloaded,numfrozen,frozenreduced)
   endif
   iorder=min(ibig*ppfac,orblanorder)
 
-  OFLWR "CALL BLOCK LAN FOR ORBS, ",numcompute," VECTORS",orbparflag; CFL
 
-  call blocklanczos0(1,numcompute,ibig,ibig,iorder,ibig*ppfac,lanspfs,ibig,&
-       energies,1,0,orblancheckmod,orblanthresh,mult_bigspf,orbparflag,orbtargetflag,orbtarget)
-
+  if (eigmode.ne.0) then
+     OFLWR "CALL BLOCK LAN FOR ORBS, ",numcompute," VECTORS",orbparflag; CFL
+     call blocklanczos0(1,numcompute,ibig,ibig,iorder,ibig*ppfac,lanspfs,ibig,&
+          energies,1,0,orblancheckmod,orblanthresh,mult_bigspf,orbparflag,orbtargetflag,orbtarget)
+     OFLWR "BLOCKLAN CALLED. ENERGIES: ";CFL
+  else
+     OFLWR "Exact Diagonalization with vector size ",totpoints; CFL
+     !$$
+     allocate(mybigspfham(totpoints,totpoints),bigvects(totpoints,totpoints), &
+          bigenergies(totpoints))
+     call getbigspfham(mybigspfham(:,:))
+     bigvects=0; bigenergies=0
+     call ECSEIG(mybigspfham,ibig,ibig,bigvects,bigenergies)
+     lanspfs(:,:) = bigvects(:,1:numcompute)
+     energies(:) = bigenergies(1:numcompute)
+     !$$
+     deallocate(mybigspfham,bigvects,bigenergies)
+     OFLWR "DIRECT DIAG CALLED. ENERGIES: ";CFL
+  endif
   if (ivoflag.ne.0) then
      deallocate(ivopot,ivo_occupied)
   endif
   
-  OFLWR "BL CALLED. ENERGIES: ";CFL
   do ispf=1,numcompute
      OFLWR ispf,energies(ispf); CFL
   enddo
@@ -319,9 +317,35 @@ subroutine init_spfs(inspfs,numloaded,numfrozen,frozenreduced)
 
 contains
 
+  subroutine ivo_project(inbigspf,outbigspf)
+    use myparams
+    implicit none
+    DATATYPE,intent(in) :: inbigspf(totpoints)
+    DATATYPE, intent(out) :: outbigspf(totpoints)
+    integer :: ii
+    outbigspf(:)=0d0
+    do ii=1,numocc
+       outbigspf(:)=outbigspf(:) + ivo_occupied(:,ii) * ivodot(ivo_occupied(:,ii),inbigspf(:),totpoints)
+    enddo
+
+  end subroutine ivo_project
+
+  function ivodot(inbra,inket,size)
+    use myparams
+    use mpisubmod    !! IN PARENT DIRECTORY
+    implicit none
+    integer,intent(in) :: size 
+    DATATYPE,intent(in) :: inbra(size),inket(size)
+    DATATYPE :: ivodot,csum
+    csum=DOT_PRODUCT(inbra,inket)
+    if (orbparflag) then
+       call mympireduceone(csum)
+    endif
+    ivodot=csum
+  end function ivodot
+
   subroutine mult_bigspf_ivo(inbigspf,outbigspf)
     use myparams
-    use ivopotmod
     use orbmultsubmod   !! IN PARENT DIRECTORY
     use orbprojectmod
     implicit none
@@ -383,7 +407,30 @@ contains
     endif
   end subroutine mult_bigspf
 
+  subroutine getbigspfham(bigspfham)
+    use myparams
+    use myprojectmod
+    use orbmultsubmod   !! IN PARENT DIRECTORY
+    implicit none
+    DATAECS,intent(out) :: bigspfham(totpoints,totpoints)
+    DATATYPE :: temppot(totpoints) , pot(totpoints)  !! AUTOMATIC
+    integer :: ii
+    
+    bigspfham = 0; temppot=0; pot=0
+
+    temppot = 1;
+    call mult_pot(1,temppot(:),pot(:))
+    
+    bigspfham(:,:) = RESHAPE(ketot%mat(:,:,:,:),(/totpoints,totpoints/));
+    do ii=1,totpoints
+       bigspfham(ii,ii) = bigspfham(ii,ii) + pot(ii)
+    enddo
+    
+  end subroutine getbigspfham
+
 end subroutine init_spfs
+
+end module initspfsmod
 
 
 subroutine init_project(inspfs,spfsloaded,pot,halfniumpot,rkemod,proderivmod,skipflag,&
@@ -393,6 +440,9 @@ subroutine init_project(inspfs,spfsloaded,pot,halfniumpot,rkemod,proderivmod,ski
   use pmpimod
   use pfileptrmod
   use myprojectmod
+  use jfunctmod
+  use initspfsmod
+  use gettwoemod
   implicit none
   integer, intent(in) :: skipflag,notused
   integer,intent(inout) :: spfsloaded
@@ -415,7 +465,6 @@ subroutine init_project(inspfs,spfsloaded,pot,halfniumpot,rkemod,proderivmod,ski
 
 !! smooth exterior scaling
   DATATYPE,allocatable :: scalefunction(:), djacobian(:), ddjacobian(:)
-  DATATYPE :: ffunct, djfunct, ddjfunct, jfunct
 
   pi=4d0*atan(1d0)
 
@@ -459,6 +508,20 @@ subroutine init_project(inspfs,spfsloaded,pot,halfniumpot,rkemod,proderivmod,ski
            enddo
         enddo
      enddo
+
+     !! (e.g. coulmode = -1 disables centrifugal)
+     !!
+     if (twomode .eq. 1 .and. coulmode > -1) then  !! soft coulomb fix
+        if (numpoints.ne.totpoints) then
+           OFLWR "Error, bad points",numpoints,totpoints; CFLST
+        endif
+        if (toepflag.ne.0) then
+           OFLWR "ERROR, toep not supported with twmode.ne.0 (softcoul)"; CFLST
+        endif
+        OFLWR "ADDING CENTRIFUGAL"; CFL
+        call addit(ketot%mat)    !!! not ketot%tam, can't use ketot%tam
+        ketot%tam = 0
+     endif  !! two coulmode >=0  
   endif
 
   th=(/ "st", "nd", "rd", "th" /)
@@ -549,8 +612,6 @@ subroutine init_project(inspfs,spfsloaded,pot,halfniumpot,rkemod,proderivmod,ski
      pot(:) = pot(:) + 0.5d0 * harmstrength * dipoles(:)**2
   endif
 
-
-
   spfsloaded=numspf   !! for mcscf... really just for BO curve to skip eigen
 
   if (debugflag.eq.90210) then
@@ -561,6 +622,98 @@ subroutine init_project(inspfs,spfsloaded,pot,halfniumpot,rkemod,proderivmod,ski
   deallocate(temppot)
 #endif
   deallocate(scalefunction, djacobian, ddjacobian)
+
+  !! END INIT_PROJECT !!
+  
+contains
+
+  !!
+  !! for soft coulomb to reproduce p-wave eigvals need to fix up even parity.
+  !!    add P 1/x^2 P  where P projects onto even.. l(l+1)/2 = 1 for p-wave centrifugal potential
+  !! even 1d functions = p wave   odd 1d functions = s wave
+  !!
+  subroutine addit(inoutmat)
+    use myparams
+    use pfileptrmod
+    implicit none
+    DATATYPE,intent(inout) :: inoutmat(totpoints,totpoints)
+    real*8, allocatable :: pproj(:,:), pproj2(:,:), myarray(:), allarray(:)
+    integer :: ii, ihalf, ibot, itop, icenter
+    real*8 :: dcenter
+
+    if (coulmode<0) then
+       OFLWR "error, addit called when coulmode<0, programmer fail"; CFLST
+    endif
+    
+    if (twomode.ne.1) then
+       OFLWR "error, addit called when twomode.ne.1: ", twomode; CFLST
+    endif
+    
+    allocate(pproj(totpoints,totpoints), pproj2(totpoints,totpoints), &
+         myarray(totpoints), allarray(totpoints))
+    pproj=0; pproj2=0; myarray=0; allarray=0;
+    
+    myarray(:) = 0d0
+    dcenter = (1+totpoints)/2d0
+    do ii=1,totpoints
+       myarray(ii) = (ii-dcenter)*spacing
+    enddo
+
+    do icenter=1,numcenters
+       
+       if (coulmode==0) then  !! integer quantum numbers even functions
+          allarray(:)= 1d0 / ( softness**2 + ( myarray(:) - centershift(icenter)*spacing/2d0 )**2 )
+       else                   !! half-integer quantum numbers even functions
+          allarray(:)= 0.375d0 / ( softness**2 + ( myarray(:) - centershift(icenter)*spacing/2d0 )**2 )
+       endif
+       
+       ihalf = floor((totpoints + 1 +1d-8 + centershift(icenter))/2d0)
+
+       itop = min(totpoints,totpoints+centershift(icenter))
+       ibot = max(1,centershift(icenter))
+
+       pproj = 0
+       do ii=1,totpoints
+          pproj(ii,ii) = 1d0
+       enddo
+       do ii=ibot,ihalf
+          pproj(          ii,           ii) =  0.5d0
+          pproj(itop+ibot-ii,           ii) =  0.5d0
+          pproj(          ii, itop+ibot-ii) =  0.5d0
+          pproj(itop+ibot-ii, itop+ibot-ii) =  0.5d0
+       enddo
+
+       do ii=1,totpoints
+          pproj2(ii,:) = pproj(ii,:) * allarray
+       enddo
+       inoutmat = inoutmat + MATMUL( pproj2, pproj )
+       
+    enddo
+
+    deallocate(myarray,pproj,pproj2,allarray)
+    
+  end subroutine addit
+  
+  subroutine get_dipoles()
+    use myparams
+    use myprojectmod  
+    implicit none
+    call get_one_dipole(dipoles(:),qbox,1,1)
+  end subroutine get_dipoles
+
+  subroutine get_one_dipole(out,whichbox,nnn,mmm)
+    use myparams
+    use myprojectmod
+    implicit none
+    integer,intent(in) :: mmm,nnn,whichbox
+    DATATYPE,intent(out) :: out(nnn,numpoints,mmm)
+    integer :: jj,ii
+    do jj=1,mmm
+       do ii=1,numpoints
+          out(:,ii,jj)=sinepoints%mat(ii,whichbox)
+       enddo
+    enddo
+  end subroutine get_one_dipole
 
 end subroutine init_project
 
